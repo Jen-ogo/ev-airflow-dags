@@ -12,7 +12,7 @@ from airflow.utils.trigger_rule import TriggerRule
 
 from docker.types import Mount
 
-from osm.osm_config import (
+from ev_repository.dags.osm.osm_config import (
     EMAIL_TO,
     HOST_DATA_DIR,
     ADLS_CONTAINER,
