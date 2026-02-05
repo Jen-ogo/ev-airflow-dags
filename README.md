@@ -60,6 +60,10 @@ Uploads both:
 - `gisco_nuts_2024_01m_4326_etl`: downloads NUTS GeoJSON for levels `[0,1,2,3]`, converts to Parquet with `geom_wkt` (no binary geom), validates schema, uploads to  
   `raw/gisco/nuts/year=2024/scale=01m/crs=4326/level=<n>/...parquet`
 
+### EV availability (dags/streaming/)
+- `tomtom_ev_enrichment_r7`: pulls top R7 candidates from Databricks (geo_databricks_sub.GOLD.FEAT_H3_MACRO_SCORE_R7) → calls TomTom POI Search (EV charging stations within a radius; radius is derived from kring_area_m2) → for each station with chargingAvailabilityId calls Charging Availability → writes enrichment into GOLD tables:
+Snowflake, Databricks
+
 ### Traffic (`dags/traffic/`)
 - `traffic_tomtom_ingestion`: scheduled every 10 minutes; loads latest candidate points snapshot from ADLS, optionally calls TomTom (or dry-run mock), pushes events to Azure EventHub, sends email. Behavior is controlled via Airflow Variables (e.g., `TRAFFIC_ENABLED`, `TOMTOM_DRY_RUN`, `EVENTHUB_ENABLED`).
 
