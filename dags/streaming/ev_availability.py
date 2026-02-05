@@ -86,8 +86,14 @@ def _coerce_ts_value(v: Any) -> Any:
     - ISO strings
     - Spark/Arrow-style structs like {'seconds_since_epoch': ..., 'nanos': ...}
     - Stringified structs like "(seconds_since_epoch=..., nanos=...)"
+    - Raw epoch numbers (seconds/ms/us/ns) as int/float/str
+
+    NOTE: We defensively clamp insane years later in `_clamp_timestamp_columns`.
     """
-    if v is None or (isinstance(v, float) and math.isnan(v)):
+
+    if v is None:
+        return None
+    if isinstance(v, float) and math.isnan(v):
         return None
 
     # pandas.Timestamp / datetime
@@ -96,49 +102,79 @@ def _coerce_ts_value(v: Any) -> Any:
     if isinstance(v, datetime):
         return v.replace(tzinfo=None)
 
-    # Dict/struct: {'seconds_since_epoch': 1770..., 'nanos': ...}
-    if isinstance(v, dict):
-        if "seconds_since_epoch" in v:
-            try:
-                # Some connectors store ns since epoch
-                secs = float(v.get("seconds_since_epoch"))
-                # Heuristic: if it's too large, assume nanoseconds
-                if secs > 10**12:
-                    secs = secs / 1e9
-                return datetime.fromtimestamp(secs, tz=timezone.utc).replace(tzinfo=None)
-            except Exception:
-                return None
-        # try generic parse
+    def _epoch_to_dt(x: float) -> datetime | None:
+        """Interpret epoch-like numeric value x into datetime.
+
+        Heuristic by magnitude:
+          - >= 1e18: nanoseconds
+          - >= 1e15: microseconds
+          - >= 1e12: milliseconds
+          - else: seconds
+        """
         try:
-            return pd.to_datetime(v, errors="coerce").to_pydatetime().replace(tzinfo=None)
+            ax = abs(float(x))
         except Exception:
             return None
 
-    # Stringified struct: "(seconds_since_epoch=1770..., nanos=...)"
-    if isinstance(v, str):
-        s = v.strip()
-        if "seconds_since_epoch" in s:
-            import re
-
-            m = re.search(r"seconds_since_epoch=([0-9]+)", s)
-            if m:
-                try:
-                    secs = float(m.group(1))
-                    if secs > 10**12:
-                        secs = secs / 1e9
-                    return datetime.fromtimestamp(secs, tz=timezone.utc).replace(tzinfo=None)
-                except Exception:
-                    return None
-        # ISO / other timestamp strings
         try:
-            dt = pd.to_datetime(s, errors="coerce")
+            if ax >= 1e18:
+                secs = float(x) / 1e9
+            elif ax >= 1e15:
+                secs = float(x) / 1e6
+            elif ax >= 1e12:
+                secs = float(x) / 1e3
+            else:
+                secs = float(x)
+            return datetime.fromtimestamp(secs, tz=timezone.utc).replace(tzinfo=None)
+        except Exception:
+            return None
+
+    # Dict/struct: {'seconds_since_epoch': 1770..., 'nanos': ...}
+    if isinstance(v, dict):
+        if "seconds_since_epoch" in v:
+            dt = _epoch_to_dt(v.get("seconds_since_epoch"))
+            return dt
+        # try generic parse
+        try:
+            dt = pd.to_datetime(v, errors="coerce")
             if pd.isna(dt):
                 return None
             return dt.to_pydatetime().replace(tzinfo=None)
         except Exception:
             return None
 
-    return v
+    # Raw epoch numbers (int/float)
+    if isinstance(v, (int, float)):
+        return _epoch_to_dt(v)
+
+    # Stringified struct / ISO / epoch strings
+    if isinstance(v, str):
+        s = v.strip()
+
+        # Pure numeric string => treat as epoch
+        if s and all(ch.isdigit() or ch in "+-." for ch in s) and any(ch.isdigit() for ch in s):
+            try:
+                return _epoch_to_dt(float(s))
+            except Exception:
+                return None
+
+        if "seconds_since_epoch" in s:
+            import re
+
+            m = re.search(r"seconds_since_epoch=([0-9]+)", s)
+            if m:
+                return _epoch_to_dt(float(m.group(1)))
+
+        # ISO / other timestamp strings
+        try:
+            dt = pd.to_datetime(s, errors="coerce", utc=True)
+            if pd.isna(dt):
+                return None
+            return dt.to_pydatetime().replace(tzinfo=None)
+        except Exception:
+            return None
+
+    return None
 
 
 def _normalize_timestamp_columns(df: pd.DataFrame, cols: Tuple[str, ...] = ("UPDATED_AT", "LOAD_TS", "SNAPSHOT_TS")) -> None:
@@ -151,6 +187,45 @@ def _normalize_timestamp_columns(df: pd.DataFrame, cols: Tuple[str, ...] = ("UPD
             df[c] = df[c].apply(_coerce_ts_value)
             # Then normalize to pandas datetime64
             df[c] = pd.to_datetime(df[c], errors="coerce").dt.tz_localize(None)
+
+
+# ------------------------------------------------------
+# Timestamp clamping helper
+# ------------------------------------------------------
+def _clamp_timestamp_columns(
+    df: pd.DataFrame,
+    cols: Tuple[str, ...] = ("UPDATED_AT", "LOAD_TS", "SNAPSHOT_TS"),
+    min_ts: str = "2000-01-01",
+    max_ts: str = "2100-01-01",
+    on_out_of_range: str = "null",
+) -> None:
+    """In-place clamp timestamp columns to a sane range.
+
+    This fixes cases like year 58066 which can appear if epoch values were misinterpreted
+    somewhere in the pipeline.
+
+    on_out_of_range:
+      - 'null'  => set to NULL
+      - 'now'   => set to current load timestamp
+    """
+    if df is None or len(df) == 0:
+        return
+
+    min_dt = pd.Timestamp(min_ts)
+    max_dt = pd.Timestamp(max_ts)
+    now_dt = pd.Timestamp(_now_utc().replace(tzinfo=None))
+
+    for c in cols:
+        if c not in df.columns:
+            continue
+        # ensure datetime64
+        df[c] = pd.to_datetime(df[c], errors="coerce")
+        mask_bad = df[c].isna() | (df[c] < min_dt) | (df[c] > max_dt)
+        if mask_bad.any():
+            if on_out_of_range == "now":
+                df.loc[mask_bad, c] = now_dt
+            else:
+                df.loc[mask_bad, c] = pd.NaT
 
 
 # ----------------------------
@@ -291,6 +366,7 @@ def enrich_candidates_with_tomtom(**context):
     dim_rows = []
     map_rows = []
     fact_rows = []
+    # Single run timestamp in UTC (stored as naive)
     load_ts = _now_utc().replace(tzinfo=None)
 
     for cand in candidates:
@@ -366,7 +442,7 @@ def enrich_candidates_with_tomtom(**context):
                 "UPDATED_AT": load_ts,
             })
 
-            # 3) Availability snapshot (если есть chargingAvailability id)
+            # 3) Availability snapshot (with chargingAvailability id)
             if charging_av_id:
                 avail_params = {"key": tomtom_key, "chargingAvailability": charging_av_id}
                 avail_json = _requests_get_json(TOMTOM_AVAIL_URL, avail_params)
@@ -378,7 +454,7 @@ def enrich_candidates_with_tomtom(**context):
                     av = (c.get("availability") or {}).get("current") or {}
                     ppl = (c.get("availability") or {}).get("perPowerLevel") or []
 
-                    # если perPowerLevel есть — пишем по нему, иначе power_kw = null
+                    # if perPowerLevel present wirte by it, else power_kw = null
                     if ppl:
                         for pl in ppl:
                             fact_rows.append({
@@ -416,19 +492,34 @@ def enrich_candidates_with_tomtom(**context):
     map_df = pd.DataFrame(map_rows)
     fact_df = pd.DataFrame(fact_rows)
 
-    # Persist to XCom as JSON-serializable chunks.
-    # IMPORTANT: use ISO timestamps to avoid Snowflake timestamp parsing issues via write_pandas.
+    # Normalize + clamp timestamps BEFORE serialization (prevents insane years like 58066)
+    _normalize_timestamp_columns(dim_df)
+    _normalize_timestamp_columns(map_df)
+    _normalize_timestamp_columns(fact_df)
+
+    _clamp_timestamp_columns(dim_df, on_out_of_range="now")
+    _clamp_timestamp_columns(map_df, on_out_of_range="now")
+    _clamp_timestamp_columns(fact_df, on_out_of_range="now")
+
+    # Serialize timestamps as plain strings to keep Snowflake/Databricks connectors from misinterpreting epochs
+    ts_cols = ("UPDATED_AT", "LOAD_TS", "SNAPSHOT_TS")
+    for _df in (dim_df, map_df, fact_df):
+        for _c in ts_cols:
+            if _c in _df.columns:
+                _df[_c] = pd.to_datetime(_df[_c], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S.%f")
+
+    # Persist to XCom as JSON-serializable chunks
     context["ti"].xcom_push(
         key="dim_df_json",
-        value=dim_df.to_json(orient="records", force_ascii=False, date_format="iso"),
+        value=dim_df.to_json(orient="records", force_ascii=False),
     )
     context["ti"].xcom_push(
         key="map_df_json",
-        value=map_df.to_json(orient="records", force_ascii=False, date_format="iso"),
+        value=map_df.to_json(orient="records", force_ascii=False),
     )
     context["ti"].xcom_push(
         key="fact_df_json",
-        value=fact_df.to_json(orient="records", force_ascii=False, date_format="iso"),
+        value=fact_df.to_json(orient="records", force_ascii=False),
     )
 
 
@@ -450,6 +541,11 @@ def load_to_snowflake(**context):
     _normalize_timestamp_columns(dim_df)
     _normalize_timestamp_columns(map_df)
     _normalize_timestamp_columns(fact_df)
+
+    # Clamp insane timestamps (e.g., year 58066) to keep Snowflake usable
+    _clamp_timestamp_columns(dim_df, on_out_of_range="now")
+    _clamp_timestamp_columns(map_df, on_out_of_range="now")
+    _clamp_timestamp_columns(fact_df, on_out_of_range="now")
 
     # NOTE: must match docker-compose env var AIRFLOW_CONN_SF_CONN
     sf = BaseHook.get_connection("sf_conn")
@@ -478,9 +574,34 @@ def load_to_snowflake(**context):
     finally:
         cur.close()
 
+    def _sf_clamp_ts(table_fqn: str, col: str) -> None:
+        """Clamp out-of-range timestamps that show as 'Invalid date' in UI.
+
+        We keep timestamps usable by forcing them into a sane range.
+        This is especially important for cases like year 58066 which can appear
+        if an epoch-like value was misinterpreted upstream.
+        """
+        sql = f"""
+        UPDATE {table_fqn}
+        SET {col} = CURRENT_TIMESTAMP()::TIMESTAMP_NTZ
+        WHERE {col} IS NULL
+           OR {col} < '2000-01-01'::TIMESTAMP_NTZ
+           OR {col} > DATEADD(day, 1, CURRENT_TIMESTAMP())::TIMESTAMP_NTZ
+        """.strip()
+        with ctx.cursor() as _c:
+            _c.execute(sql)
+
+    def _sf_postfix_clamp_all() -> None:
+        # DIM
+        _sf_clamp_ts(SF_DIM, "UPDATED_AT")
+        # MAP
+        _sf_clamp_ts(SF_MAP, "LOAD_TS")
+        # FACT
+        _sf_clamp_ts(SF_FACT, "SNAPSHOT_TS")
+
     try:
-        # DIM: upsert-поведение проще делать через stage+merge, но для старта — append.
-        # Если нужен MERGE — скажи, дам Snowflake MERGE через temp stage.
+        # DIM: upsert via write_pandas (append)
+        # merge can be via temp stage or via a staging table. We choose staging table for better visibility and easier debugging.
         if len(dim_df) > 0:
             write_pandas(ctx, dim_df, table_name="DIM_TOMTOM_EV_STATIONS", schema=SF_SCHEMA, database=SF_DB)
 
@@ -490,15 +611,72 @@ def load_to_snowflake(**context):
         if len(fact_df) > 0:
             write_pandas(ctx, fact_df, table_name="FACT_TOMTOM_EV_AVAILABILITY_SNAPSHOTS", schema=SF_SCHEMA, database=SF_DB)
 
+        # Post-fix clamp for any bad timestamps that can still slip through
+        # and render as 'Invalid date' in Snowflake UI.
+        _sf_postfix_clamp_all()
+
     finally:
         ctx.close()
 
 
 # ----------------------------
+# Databricks DBFS upload (fast path for small landing files)
+# ----------------------------
+
+def _dbx_base_url(host: str) -> str:
+    h = (host or "").strip()
+    if h.startswith("http://") or h.startswith("https://"):
+        return h.rstrip("/")
+    return f"https://{h}".rstrip("/")
+
+
+def _dbfs_put_small(base_url: str, token: str, local_path: str, dbfs_path: str, overwrite: bool = True) -> None:
+    """Upload a small file to DBFS using /api/2.0/dbfs/put.
+
+    NOTE: This uses the simple 'contents' API (base64). Keep files reasonably small.
+    Our run is limited (TOP_CANDIDATES=50), so parquets should be small.
+    """
+    import base64
+
+    size_bytes = os.path.getsize(local_path)
+    if size_bytes > 8 * 1024 * 1024:
+        raise RuntimeError(
+            f"DBFS put (contents) supports small files; got {size_bytes} bytes for {local_path}. "
+            "Use a larger-file upload flow (create/add-block/close) or store to ADLS."
+        )
+
+    with open(local_path, "rb") as f:
+        data_b64 = base64.b64encode(f.read()).decode("utf-8")
+
+    url = f"{base_url}/api/2.0/dbfs/put"
+    headers = {"Authorization": f"Bearer {token}"}
+    # DBFS REST API expects paths like "/tmp/..." (no "dbfs:/" prefix).
+    api_path = dbfs_path
+    if api_path.startswith("dbfs:/"):
+        api_path = "/" + api_path[len("dbfs:/"):]
+    elif api_path.startswith("dbfs:"):
+        api_path = "/" + api_path[len("dbfs:"):].lstrip("/")
+    if not api_path.startswith("/"):
+        api_path = "/" + api_path
+
+    payload = {"path": api_path, "contents": data_b64, "overwrite": overwrite}
+
+    r = requests.post(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT)
+    r.raise_for_status()
+
+# ----------------------------
 # Databricks load (SQL Warehouse)
 # ----------------------------
 def load_to_databricks_sql(**context):
-    """Append DIM/MAP/FACT into Databricks Delta tables via SQL Warehouse."""
+    """Fast append into Databricks Delta using COPY INTO from Parquet files uploaded to DBFS.
+
+    Why: `executemany INSERT` via SQL Warehouse is slow. Instead we:
+      1) build small Parquet landing files in Airflow
+      2) upload them to DBFS via REST
+      3) run 3 COPY INTO statements (DIM/MAP/FACT)
+
+    This keeps Databricks load comparable to Snowflake speed for small batches.
+    """
     from airflow.hooks.base import BaseHook
 
     dim_json = context["ti"].xcom_pull(key="dim_df_json", task_ids="tomtom_enrich")
@@ -509,18 +687,42 @@ def load_to_databricks_sql(**context):
     map_df = pd.read_json(io.StringIO(map_json), orient="records")
     fact_df = pd.read_json(io.StringIO(fact_json), orient="records")
 
-    # Normalize timestamps coming from XCom JSON (defensive: handles Spark-style structs too)
+    # Normalize timestamps from string form
     _normalize_timestamp_columns(dim_df)
     _normalize_timestamp_columns(map_df)
     _normalize_timestamp_columns(fact_df)
 
-    # Databricks SQL connector can't insert dicts — stringify RAW json fields.
+    # Clamp insane timestamps (defensive)
+    _clamp_timestamp_columns(dim_df, on_out_of_range="now")
+    _clamp_timestamp_columns(map_df, on_out_of_range="now")
+    _clamp_timestamp_columns(fact_df, on_out_of_range="now")
+
+    # Databricks SQL can't insert dicts — stringify RAW json fields.
     if "RAW_POI_JSON" in dim_df.columns:
-        dim_df["RAW_POI_JSON"] = dim_df["RAW_POI_JSON"].apply(lambda x: json.dumps(x, ensure_ascii=False) if isinstance(x, (dict, list)) else x)
+        dim_df["RAW_POI_JSON"] = dim_df["RAW_POI_JSON"].apply(
+            lambda x: json.dumps(x, ensure_ascii=False) if isinstance(x, (dict, list)) else x
+        )
     if "RAW_SEARCH_JSON" in map_df.columns:
-        map_df["RAW_SEARCH_JSON"] = map_df["RAW_SEARCH_JSON"].apply(lambda x: json.dumps(x, ensure_ascii=False) if isinstance(x, (dict, list)) else x)
+        map_df["RAW_SEARCH_JSON"] = map_df["RAW_SEARCH_JSON"].apply(
+            lambda x: json.dumps(x, ensure_ascii=False) if isinstance(x, (dict, list)) else x
+        )
     if "RAW_AVAIL_JSON" in fact_df.columns:
-        fact_df["RAW_AVAIL_JSON"] = fact_df["RAW_AVAIL_JSON"].apply(lambda x: json.dumps(x, ensure_ascii=False) if isinstance(x, (dict, list)) else x)
+        fact_df["RAW_AVAIL_JSON"] = fact_df["RAW_AVAIL_JSON"].apply(
+            lambda x: json.dumps(x, ensure_ascii=False) if isinstance(x, (dict, list)) else x
+        )
+
+    # IMPORTANT: Databricks/Delta can treat column names case-sensitively during schema merge.
+    # Our DataFrames are in UPPER_SNAKE, while existing Delta tables may have lower_snake.
+    # Normalize to lower-case to avoid merge conflicts like 'updated_at' vs 'UPDATED_AT'.
+    def _lowercase_columns(df: pd.DataFrame) -> pd.DataFrame:
+        if df is None or len(df) == 0:
+            return df
+        df.columns = [str(c).lower() for c in df.columns]
+        return df
+
+    dim_df = _lowercase_columns(dim_df)
+    map_df = _lowercase_columns(map_df)
+    fact_df = _lowercase_columns(fact_df)
 
     conn = BaseHook.get_connection("databricks_sql")
     host = conn.host
@@ -529,86 +731,195 @@ def load_to_databricks_sql(**context):
     if not http_path:
         raise ValueError("databricks_sql.extra.http_path is required")
 
-    def _dbx_sql_type_from_series(col: str, s: pd.Series) -> str:
-        """Best-effort mapping pandas dtype -> Databricks SQL type."""
-        c = col.upper()
-        if c.startswith("RAW_") or c.endswith("_JSON"):
-            return "STRING"
-        if c.endswith("_TS") or c.endswith("_AT") or c.endswith("_TIME"):
-            return "TIMESTAMP"
-        # dtype-based fallbacks
-        if pd.api.types.is_integer_dtype(s):
-            return "INT"
-        if pd.api.types.is_float_dtype(s):
-            return "DOUBLE"
-        if pd.api.types.is_bool_dtype(s):
-            return "BOOLEAN"
-        if pd.api.types.is_datetime64_any_dtype(s):
-            return "TIMESTAMP"
-        return "STRING"
+    base_url = _dbx_base_url(host)
 
-    def _ensure_table_columns(table_fqn: str, df: pd.DataFrame):
-        """Ensure Databricks Delta table has all columns present in df (adds missing columns)."""
+    run_ts = _now_utc().strftime("%Y%m%d_%H%M%S")
+    local_dir = f"/tmp/tomtom_ev_dbx_load_{run_ts}"
+    os.makedirs(local_dir, exist_ok=True)
+
+    def _write_parquet_dbx_compatible(df: pd.DataFrame, path: str) -> None:
+        """Write Parquet in a Databricks-SQL friendly way.
+
+        We intentionally write *timestamp columns as strings* to avoid:
+          - Parquet TIMESTAMP(NANOS) incompatibilities
+          - Delta schema merge conflicts when an existing table has a different timestamp type
+
+        We will CAST to the target column types during the INSERT step.
+        """
         if df is None or len(df) == 0:
             return
 
-        # Fetch existing columns via DESCRIBE TABLE
-        existing_cols: set[str] = set()
+        ts_cols = [c for c in ("updated_at", "load_ts", "snapshot_ts") if c in df.columns]
+        for c in ts_cols:
+            # Normalize to datetime then format as string with microseconds
+            df[c] = pd.to_datetime(df[c], errors="coerce")
+            try:
+                df[c] = df[c].dt.floor("us")
+            except Exception:
+                pass
+            # Use an unambiguous format; keep as STRING in parquet
+            df[c] = df[c].dt.strftime("%Y-%m-%d %H:%M:%S.%f")
+
+        # Ensure consistent column order for stable ingestion
+        df = df.copy()
+
+        df.to_parquet(
+            path,
+            index=False,
+            engine="pyarrow",
+        )
+
+    # Write small Parquet landing files
+    dim_path = os.path.join(local_dir, "dim_tomtom_ev_stations.parquet")
+    map_path = os.path.join(local_dir, "map_candidate_tomtom_stations.parquet")
+    fact_path = os.path.join(local_dir, "fact_tomtom_ev_availability_snapshots.parquet")
+
+    if len(dim_df) > 0:
+        _write_parquet_dbx_compatible(dim_df, dim_path)
+    if len(map_df) > 0:
+        _write_parquet_dbx_compatible(map_df, map_path)
+    if len(fact_df) > 0:
+        _write_parquet_dbx_compatible(fact_df, fact_path)
+
+    # Upload to DBFS
+    dbfs_dir = f"dbfs:/tmp/tomtom_ev_enrichment/{run_ts}"
+
+    if os.path.isfile(dim_path):
+        _dbfs_put_small(base_url, token, dim_path, f"{dbfs_dir}/dim_tomtom_ev_stations.parquet")
+    if os.path.isfile(map_path):
+        _dbfs_put_small(base_url, token, map_path, f"{dbfs_dir}/map_candidate_tomtom_stations.parquet")
+    if os.path.isfile(fact_path):
+        _dbfs_put_small(base_url, token, fact_path, f"{dbfs_dir}/fact_tomtom_ev_availability_snapshots.parquet")
+
+    def _describe_table(table_fqn: str) -> List[Tuple[str, str]]:
+        """Return ordered list of (column_name_lower, data_type) for a Delta table."""
         with dbsql.connect(server_hostname=host, http_path=http_path, access_token=token) as c:
             with c.cursor() as cur:
                 cur.execute(f"DESCRIBE TABLE {table_fqn}")
-                for row in cur.fetchall():
-                    # DESCRIBE TABLE returns (col_name, data_type, comment) rows; partition info rows may follow
-                    col_name = row[0]
-                    if not col_name or str(col_name).strip() == "" or str(col_name).lower().startswith("#"):
-                        continue
-                    # stop when we reach the partition/information section (Databricks uses empty line or '#')
-                    if str(col_name).strip().lower() in ("# col_name", "col_name"):
-                        continue
-                    if str(col_name).strip().lower() in ("# partition information", "# detailed table information"):
-                        break
-                    existing_cols.add(str(col_name).strip().lower())
+                rows = cur.fetchall()
 
-        missing_defs: list[str] = []
-        for col in df.columns:
-            if str(col).strip().lower() in existing_cols:
+        cols: List[Tuple[str, str]] = []
+        for r in rows:
+            if not r:
                 continue
-            sql_type = _dbx_sql_type_from_series(col, df[col])
-            missing_defs.append(f"`{col}` {sql_type}")
+            col = str(r[0] or "").strip()
+            dtype = str(r[1] or "").strip()
+            if not col or col.startswith("#"):
+                continue
+            # Stop at partition/info sections
+            if col.lower() in ("partition", "# partitioning", "# partitions"):
+                break
+            cols.append((col.lower(), dtype))
+        return cols
 
-        if not missing_defs:
-            return
+    def _describe_parquet(dbfs_file: str):
+        """Return Parquet schema as list of (col_name, data_type).
 
-        alter_sql = f"ALTER TABLE {table_fqn} ADD COLUMNS ({', '.join(missing_defs)})"
-        # Execute ALTER; if concurrent runs added some cols already, ignore the error.
-        try:
-            with dbsql.connect(server_hostname=host, http_path=http_path, access_token=token) as c:
-                with c.cursor() as cur:
-                    cur.execute(alter_sql)
-        except Exception:
-            pass
+        NOTE: Databricks SQL Warehouses may fail on `DESCRIBE TABLE parquet.`...``
+        even when `SELECT * FROM parquet.`...`` works. We therefore use
+        `SELECT ... LIMIT 0` and rely on cursor.description.
+        """
+        # Read 0 rows to obtain the schema via DB-API cursor metadata.
+        with dbsql.connect(server_hostname=host, http_path=http_path, access_token=token) as c:
+            with c.cursor() as cur:
+                cur.execute(f"SELECT * FROM parquet.`{dbfs_file}` LIMIT 0")
 
-    def _insert_df(table_fqn: str, df: pd.DataFrame):
-        if df is None or len(df) == 0:
-            return
+                schema = []
+                # DB-API: description items are typically
+                # (name, type_code, display_size, internal_size, precision, scale, null_ok)
+                for d in (cur.description or []):
+                    col_name = d[0]
+                    type_code = d[1] if len(d) > 1 else None
 
-        # Make sure the destination table schema can accept all columns.
-        _ensure_table_columns(table_fqn, df)
+                    # databricks-sql usually returns a string type name; if not, fall back.
+                    if isinstance(type_code, str) and type_code:
+                        data_type = type_code
+                    else:
+                        data_type = "STRING"
 
-        cols = list(df.columns)
-        placeholders = ",".join(["?"] * len(cols))
-        col_list = ",".join([f"`{c}`" for c in cols])
-        sql_ins = f"INSERT INTO {table_fqn} ({col_list}) VALUES ({placeholders})"
-        values = [tuple(row) for row in df.itertuples(index=False, name=None)]
+                    schema.append((col_name, data_type))
+
+                if not schema:
+                    raise RuntimeError(
+                        f"Could not infer schema for parquet file: {dbfs_file}. "
+                        "`SELECT ... LIMIT 0` returned no cursor metadata."
+                    )
+
+                return schema
+
+    def _insert_from_parquet(table_fqn: str, dbfs_file: str) -> None:
+        """Insert rows from a parquet file into an existing Delta table.
+
+        Key idea: do NOT rely on COPY INTO + mergeSchema (fragile). Instead:
+          - read parquet as a relation
+          - project exactly the target columns (explicit column list)
+          - CAST where needed (especially timestamps)
+          - for target columns missing in parquet, insert NULL casted to the target type
+
+        This prevents schema-merge errors like:
+          - PARQUET_TYPE_ILLEGAL TIMESTAMP(NANOS)
+          - DELTA_FAILED_TO_MERGE_FIELDS (case/type conflicts)
+        """
+        target_cols = _describe_table(table_fqn)
+        if not target_cols:
+            raise RuntimeError(f"Failed to DESCRIBE TABLE {table_fqn}")
+
+        src_schema = _describe_parquet(dbfs_file)
+
+        # src_schema is now a list of (col_name, data_type)
+        src_cols = [r[0].lower() for r in src_schema]
+
+        insert_cols_sql = ", ".join([f"`{c}`" for c, _t in target_cols])
+
+        select_exprs: List[str] = []
+        for col_lc, dtype in target_cols:
+            dt = (dtype or "").upper()
+
+            if col_lc in src_cols:
+                if col_lc in ("updated_at", "load_ts", "snapshot_ts"):
+                    if "TIMESTAMP" in dt or "DATE" in dt:
+                        # src is STRING; parse safely
+                        select_exprs.append(f"TRY_TO_TIMESTAMP(src.`{col_lc}`) AS `{col_lc}`")
+                    else:
+                        select_exprs.append(f"src.`{col_lc}` AS `{col_lc}`")
+                else:
+                    # keep as-is; Spark will try to coerce if needed
+                    select_exprs.append(f"src.`{col_lc}` AS `{col_lc}`")
+            else:
+                # Column missing in parquet: insert NULL casted to target type where possible
+                if "TIMESTAMP" in dt:
+                    select_exprs.append(f"CAST(NULL AS TIMESTAMP) AS `{col_lc}`")
+                elif dt.startswith("DECIMAL") or dt.startswith("NUMERIC"):
+                    select_exprs.append(f"CAST(NULL AS {dtype}) AS `{col_lc}`")
+                elif dt in ("BIGINT", "INT", "INTEGER", "SMALLINT", "TINYINT", "DOUBLE", "FLOAT", "BOOLEAN", "STRING"):
+                    select_exprs.append(f"CAST(NULL AS {dt}) AS `{col_lc}`")
+                else:
+                    # fallback
+                    select_exprs.append(f"NULL AS `{col_lc}`")
+
+        select_sql = ",\n  ".join(select_exprs)
+
+        sql = f"""
+INSERT INTO {table_fqn} ({insert_cols_sql})
+SELECT
+  {select_sql}
+FROM parquet.`{dbfs_file}` AS src
+""".strip()
 
         with dbsql.connect(server_hostname=host, http_path=http_path, access_token=token) as c:
             with c.cursor() as cur:
-                cur.executemany(sql_ins, values)
+                cur.execute(sql)
 
-    # Append
-    _insert_df(DBX_DIM, dim_df)
-    _insert_df(DBX_MAP, map_df)
-    _insert_df(DBX_FACT, fact_df)
+    # Robust INSERT (append) with type casting
+    if os.path.isfile(dim_path):
+        _insert_from_parquet(DBX_DIM, f"{dbfs_dir}/dim_tomtom_ev_stations.parquet")
+    if os.path.isfile(map_path):
+        _insert_from_parquet(DBX_MAP, f"{dbfs_dir}/map_candidate_tomtom_stations.parquet")
+    if os.path.isfile(fact_path):
+        _insert_from_parquet(DBX_FACT, f"{dbfs_dir}/fact_tomtom_ev_availability_snapshots.parquet")
+
+    # Save DBFS dir for debugging
+    context["ti"].xcom_push(key="dbfs_load_dir", value=dbfs_dir)
 
 
 # ----------------------------
