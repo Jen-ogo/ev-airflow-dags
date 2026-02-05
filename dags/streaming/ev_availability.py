@@ -12,7 +12,11 @@ import io
 import requests
 from airflow import DAG
 from airflow.models import Variable
+from airflow.operators.email import EmailOperator
 from airflow.operators.python import PythonOperator
+from airflow.utils.trigger_rule import TriggerRule
+
+from ev_repository.dags.osm.osm_config import EMAIL_TO
 
 # Optional deps:
 # pip install databricks-sql-connector snowflake-connector-python pandas pyarrow
@@ -676,4 +680,120 @@ with DAG(
         python_callable=save_parquet_for_databricks,
     )
 
+    success = EmailOperator(
+        task_id="success",
+        to=EMAIL_TO,
+        subject=(
+            "[SUCCESS] TomTom EV enrichment | dag={{ dag.dag_id }} | ds={{ ds }} | run={{ run_id }}"
+        ),
+        html_content="""
+        <h2>✅ TomTom EV enrichment succeeded</h2>
+
+        <h3>Run info</h3>
+        <ul>
+          <li><b>DAG</b>: {{ dag.dag_id }}</li>
+          <li><b>ds</b>: {{ ds }}</li>
+          <li><b>Run ID</b>: {{ run_id }}</li>
+          <li><b>Logical date</b>: {{ logical_date }}</li>
+          <li><b>Data interval</b>: {{ data_interval_start }} → {{ data_interval_end }}</li>
+          <li><b>DAG start</b>: {{ dag_run.start_date }}</li>
+          <li><b>DAG end</b>: {{ dag_run.end_date }}</li>
+        </ul>
+
+        <h3>Tasks</h3>
+        <table border="1" cellpadding="6" cellspacing="0">
+          <thead>
+            <tr>
+              <th>task_id</th>
+              <th>state</th>
+              <th>try</th>
+              <th>start</th>
+              <th>end</th>
+              <th>duration (s)</th>
+              <th>log</th>
+            </tr>
+          </thead>
+          <tbody>
+          {% for t in dag_run.get_task_instances() %}
+            <tr>
+              <td>{{ t.task_id }}</td>
+              <td>{{ t.state }}</td>
+              <td>{{ t.try_number }}</td>
+              <td>{{ t.start_date }}</td>
+              <td>{{ t.end_date }}</td>
+              <td>{{ t.duration }}</td>
+              <td><a href="{{ t.log_url }}">Open log</a></td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+
+        <p>Airflow UI: <a href="{{ ti.log_url }}">Open this notification task log</a></p>
+        """,
+        conn_id="smtp_default",
+        trigger_rule=TriggerRule.ALL_SUCCESS,
+    )
+
+    failure = EmailOperator(
+        task_id="failure",
+        to=EMAIL_TO,
+        subject=(
+            "[FAILED] TomTom EV enrichment | dag={{ dag.dag_id }} | ds={{ ds }} | run={{ run_id }}"
+        ),
+        html_content="""
+        <h2>❌ TomTom EV enrichment failed</h2>
+
+        <h3>Run info</h3>
+        <ul>
+          <li><b>DAG</b>: {{ dag.dag_id }}</li>
+          <li><b>ds</b>: {{ ds }}</li>
+          <li><b>Run ID</b>: {{ run_id }}</li>
+          <li><b>Logical date</b>: {{ logical_date }}</li>
+          <li><b>Data interval</b>: {{ data_interval_start }} → {{ data_interval_end }}</li>
+          <li><b>DAG start</b>: {{ dag_run.start_date }}</li>
+          <li><b>DAG end</b>: {{ dag_run.end_date }}</li>
+        </ul>
+
+        <h3>Tasks (states at time of notification)</h3>
+        <table border="1" cellpadding="6" cellspacing="0">
+          <thead>
+            <tr>
+              <th>task_id</th>
+              <th>state</th>
+              <th>try</th>
+              <th>start</th>
+              <th>end</th>
+              <th>duration (s)</th>
+              <th>log</th>
+            </tr>
+          </thead>
+          <tbody>
+          {% for t in dag_run.get_task_instances() %}
+            <tr>
+              <td>{{ t.task_id }}</td>
+              <td><b>{{ t.state }}</b></td>
+              <td>{{ t.try_number }}</td>
+              <td>{{ t.start_date }}</td>
+              <td>{{ t.end_date }}</td>
+              <td>{{ t.duration }}</td>
+              <td><a href="{{ t.log_url }}">Open log</a></td>
+            </tr>
+          {% endfor %}
+          </tbody>
+        </table>
+
+        <p><b>Tip:</b> open logs for tasks with state <code>failed</code> / <code>upstream_failed</code>.</p>
+        <p>Airflow UI: <a href="{{ ti.log_url }}">Open this notification task log</a></p>
+        """,
+        conn_id="smtp_default",
+        trigger_rule=TriggerRule.ONE_FAILED,
+    )
+
+    # Main pipeline
     t1 >> t2 >> [t3, t3b, t4]
+
+    # Success only after all three load branches succeed
+    [t3, t3b, t4] >> success
+
+    # Failure if any task fails
+    [t1, t2, t3, t3b, t4] >> failure
