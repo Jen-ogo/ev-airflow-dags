@@ -293,8 +293,13 @@ with DAG(
         if not api_key:
             raise RuntimeError("TomTom API key not found. Set TOMTOM_TRAFFIC_API_KEY (preferred) or TOMTOM_API_KEY.")
 
-        run_id = os.environ.get("AIRFLOW_CTX_DAG_RUN_ID") or "manual"
+        dag_run = ctx.get("dag_run")
+        run_id = ctx.get("run_id") or (getattr(dag_run, "run_id", None) if dag_run else None) or "manual"
         snapshot_ts = datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+        airflow_dag_id = (ctx.get("dag").dag_id if ctx.get("dag") else None) or DAG_ID
+        airflow_task_id = getattr(ti, "task_id", None)
+        airflow_try_number = getattr(ti, "try_number", None)
 
         events: List[Dict[str, Any]] = []
         api_calls = 0
@@ -319,6 +324,10 @@ with DAG(
                 "run_id": run_id,
                 "snapshot_ts": snapshot_ts,
                 "source": "TOMTOM",
+                "airflow_dag_id": airflow_dag_id,
+                "airflow_task_id": airflow_task_id,
+                "airflow_run_id": run_id,
+                "airflow_try_number": airflow_try_number,
 
                 "tomtom_zoom": TOMTOM_ZOOM,
                 "tomtom_version": TOMTOM_SERVICE_VERSION,
@@ -358,7 +367,44 @@ with DAG(
             # throttling to avoid burst
             time.sleep(SLEEP_BETWEEN_CALLS_SEC)
 
-        return {"events": events, "api_calls": api_calls, "failed_calls": failed_calls}
+        # ------------------------------------------------------------
+        # Send this batch immediately to Event Hub (more "live" stream)
+        # ------------------------------------------------------------
+        sent = 0
+        if Variable.get("EVENTHUB_ENABLED", "false") == "true" and events:
+            producer = EventHubProducerClient.from_connection_string(
+                Variable.get("EVENTHUB_CONN_STR"),
+                eventhub_name=Variable.get("EVENTHUB_NAME"),
+            )
+
+            with producer:
+                batch = producer.create_batch()
+                for e in events:
+                    try:
+                        batch.add(EventData(json.dumps(e)))
+                    except ValueError:
+                        # batch full by size; send current batch and start new
+                        producer.send_batch(batch)
+                        batch = producer.create_batch()
+                        batch.add(EventData(json.dumps(e)))
+
+                    sent += 1
+
+                    # optional safety: avoid huge batches even if size allows
+                    if sent % EVENTHUB_BATCH_MAX_EVENTS == 0:
+                        producer.send_batch(batch)
+                        batch = producer.create_batch()
+
+                # send remainder
+                if len(batch) > 0:
+                    producer.send_batch(batch)
+
+        return {
+            "batch_id": batch_id,
+            "sent": sent,
+            "api_calls": api_calls,
+            "failed_calls": failed_calls,
+        }
 
     # ============================================================
     # 4) PUSH TO EVENT HUB (BATCHED)
@@ -370,52 +416,24 @@ with DAG(
 
         total_api_calls = 0
         total_failed_calls = 0
-        events: List[Dict[str, Any]] = []
+        total_sent = 0
+        batches = 0
 
         for r in results:
             if not isinstance(r, dict):
                 continue
+            batches += 1
             total_api_calls += int(r.get("api_calls", 0) or 0)
             total_failed_calls += int(r.get("failed_calls", 0) or 0)
-            evs = r.get("events", []) or []
-            if isinstance(evs, list) and evs:
-                events.extend(evs)
+            total_sent += int(r.get("sent", 0) or 0)
 
-        if Variable.get("EVENTHUB_ENABLED", "false") != "true":
-            return {"sent": 0, "api_calls": total_api_calls, "failed_calls": total_failed_calls}
-
-        if not events:
-            return {"sent": 0, "api_calls": total_api_calls, "failed_calls": total_failed_calls}
-
-        producer = EventHubProducerClient.from_connection_string(
-            Variable.get("EVENTHUB_CONN_STR"),
-            eventhub_name=Variable.get("EVENTHUB_NAME"),
-        )
-
-        sent = 0
-        with producer:
-            batch = producer.create_batch()
-            for e in events:
-                try:
-                    batch.add(EventData(json.dumps(e)))
-                except ValueError:
-                    # batch full by size; send current batch and start new
-                    producer.send_batch(batch)
-                    batch = producer.create_batch()
-                    batch.add(EventData(json.dumps(e)))
-
-                sent += 1
-
-                # optional safety: avoid huge batches even if size allows
-                if sent % EVENTHUB_BATCH_MAX_EVENTS == 0:
-                    producer.send_batch(batch)
-                    batch = producer.create_batch()
-
-            # send remainder
-            if len(batch) > 0:
-                producer.send_batch(batch)
-
-        return {"sent": sent, "api_calls": total_api_calls, "failed_calls": total_failed_calls}
+        # Note: sending happens inside each mapped `fetch_traffic_batch` task.
+        return {
+            "sent": total_sent,
+            "api_calls": total_api_calls,
+            "failed_calls": total_failed_calls,
+            "batches": batches,
+        }
 
 
     # ============================================================
@@ -448,6 +466,7 @@ with DAG(
           <li><b>TomTom API calls</b>: {{ st['api_calls'] if st and 'api_calls' in st else 'n/a' }}</li>
           <li><b>Failed TomTom calls</b>: {{ st['failed_calls'] if st and 'failed_calls' in st else 'n/a' }}</li>
           <li><b>Events sent to Event Hub</b>: {{ st['sent'] if st and 'sent' in st else 'n/a' }}</li>
+          <li><b>Batches processed</b>: {{ st['batches'] if st and 'batches' in st else 'n/a' }}</li>
         </ul>
 
         <h3>Tasks</h3>
