@@ -72,10 +72,7 @@ DEFAULT_ARGS = {
 }
 
 # --- Snowflake RAW table (куда пишет Kafka Connect из Kafka/EventHub) ---
-# Таблица RAW имеет 3 колонки:
 #   RECORD_METADATA VARIANT, RECORD_CONTENT VARIANT, INSERTED_AT TIMESTAMP_NTZ
-# и хранит сырой стрим без строгих типов.
-# ВАЖНО: дефолт выставляем на твою фактическую RAW таблицу.
 SF_ROW_TABLE = Variable.get(
     "SF_TRAFFIC_ROW_TABLE",
     default_var="GEO_PROJECT.GOLD.FACT_TOMTOM_TRAFFIC_FLOWSEGMENT_SNAPSHOTS_R7__KAFKA_RAW",
